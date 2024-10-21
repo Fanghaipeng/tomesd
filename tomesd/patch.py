@@ -4,8 +4,20 @@ from typing import Type, Dict, Any, Tuple, Callable
 
 from . import merge
 from .utils import isinstance_str, init_generator
+from torch import nn
+def _chunked_feed_forward(ff: nn.Module, hidden_states: torch.Tensor, chunk_dim: int, chunk_size: int):
+    # "feed_forward_chunk_size" can be used to save memory
+    if hidden_states.shape[chunk_dim] % chunk_size != 0:
+        raise ValueError(
+            f"`hidden_states` dimension to be chunked: {hidden_states.shape[chunk_dim]} has to be divisible by chunk size: {chunk_size}. Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
+        )
 
-
+    num_chunks = hidden_states.shape[chunk_dim] // chunk_size
+    ff_output = torch.cat(
+        [ff(hid_slice) for hid_slice in hidden_states.chunk(num_chunks, dim=chunk_dim)],
+        dim=chunk_dim,
+    )
+    return ff_output
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
     original_h, original_w = tome_info["size"]
@@ -28,8 +40,24 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
         # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
         # batch, which causes artifacts with use_rand, so force it to be off.
         use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-        m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
+        if args["step"] < 20:
+            # m, u = merge.structural_tokenselect(x, w, h, args["ratio"], 
+            #                                           no_rand=not use_rand, generator=args["generator"])
+            m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
                                                       no_rand=not use_rand, generator=args["generator"])
+        else: 
+            m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
+                                                      no_rand=not use_rand, generator=args["generator"])
+        # m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
+        #                                               no_rand=not use_rand, generator=args["generator"])
+        # m, u = merge.structural_tokenmerge(x, w, h, args["ratio"], 
+        #                                               no_rand=not use_rand, generator=args["generator"])
+          
+        # m, u = merge.structural_tokenselect_maxarea2(x, w, h, args["ratio"], 
+        #                                               no_rand=not use_rand, generator=args["generator"])
+        
+        # m, u = merge.soft_interpolate(x, w, h, args["sx"], args["sy"], args["ratio"], 
+        #                                               no_rand=not use_rand, generator=args["generator"])
     else:
         m, u = (merge.do_nothing, merge.do_nothing)
 
@@ -38,12 +66,6 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
     m_m, u_m = (m, u) if args["merge_mlp"]       else (merge.do_nothing, merge.do_nothing)
 
     return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
-
-
-
-
-
-
 
 def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     """
@@ -66,11 +88,6 @@ def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
             return x
     
     return ToMeBlock
-
-
-
-
-
 
 def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     """
@@ -158,23 +175,117 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
 
     return ToMeBlock
 
+import torch.nn.functional as F
+def average_cosine_similarity(hidden_states):
+    # 归一化hidden_states，以便于计算余弦相似度
+    normed_vectors = F.normalize(hidden_states, p=2, dim=2)
+    
+    # 计算余弦相似度矩阵
+    cosine_sim_matrix = torch.matmul(normed_vectors, normed_vectors.transpose(1, 2))
+    
+    # 仅考虑上三角部分，避免自比较和重复计算
+    upper_tri_indices = torch.triu_indices(cosine_sim_matrix.size(1), cosine_sim_matrix.size(2), offset=1)
+    average_similarity = cosine_sim_matrix[:, upper_tri_indices[0], upper_tri_indices[1]].mean()
+    
+    return average_similarity
 
 
+def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+    """
+    Make a patched class for a diffusers model.
+    This patch applies ToMe to the forward function of the block.
+    """
+    class JointTransformerBlock_ToMe(block_class):
+        # Save for unpatching later
+        _parent = block_class
+
+        def forward(
+            self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor
+        ):  
+            
+            # 计算初始hidden_states的平均余弦相似度
+            average_sim = average_cosine_similarity(hidden_states)
+            
+            # 将相似度写入文件
+            with open("/data1/fanghaipeng/project/sora/tomesd/tomesd/average_cosine_similarity.txt", "a") as file:
+                file.write(f"{average_sim.item()}\n")
+
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
+
+            # (1) ToMe
+            m_a, _, m_m, u_a, _, u_m = compute_merge(norm_hidden_states, self._tome_info)
+
+            if self.context_pre_only:
+                norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states, temb)
+            else:
+                norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
+                    encoder_hidden_states, emb=temb
+                )
+
+            # (2) ToMe m_a
+            norm_hidden_states = m_a(norm_hidden_states)
+
+            # Attention.
+            attn_output, context_attn_output = self.attn(
+                hidden_states=norm_hidden_states, encoder_hidden_states=norm_encoder_hidden_states
+            )
+
+            # Process attention outputs for the `hidden_states`.
+            attn_output = gate_msa.unsqueeze(1) * attn_output
+
+            # (3) ToMe u_a
+            hidden_states = hidden_states + u_a(attn_output)
+            
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+            # (4) ToMe m_m
+            norm_hidden_states = m_m(norm_hidden_states)
+
+            if self._chunk_size is not None:
+                # "feed_forward_chunk_size" can be used to save memory
+                ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
+            else:
+                ff_output = self.ff(norm_hidden_states)
+            ff_output = gate_mlp.unsqueeze(1) * ff_output
+
+            # (5) ToMe u_m
+            hidden_states = hidden_states + u_m(ff_output)
+
+            # Process attention outputs for the `encoder_hidden_states`.
+            if self.context_pre_only:
+                encoder_hidden_states = None
+            else:
+                context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
+                encoder_hidden_states = encoder_hidden_states + context_attn_output
+
+                norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+                norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+                if self._chunk_size is not None:
+                    # "feed_forward_chunk_size" can be used to save memory
+                    context_ff_output = _chunked_feed_forward(
+                        self.ff_context, norm_encoder_hidden_states, self._chunk_dim, self._chunk_size
+                    )
+                else:
+                    context_ff_output = self.ff_context(norm_encoder_hidden_states)
+                encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+
+            return encoder_hidden_states, hidden_states
+
+    return JointTransformerBlock_ToMe
 
 
 
 def hook_tome_model(model: torch.nn.Module):
     """ Adds a forward pre hook to get the image size. This hook can be removed with remove_patch. """
     def hook(module, args):
-        module._tome_info["size"] = (args[0].shape[2], args[0].shape[3])
+        if isinstance_str(module, "SD3Transformer2DModel"):
+            donothing = True
+        else:
+            module._tome_info["size"] = (args[0].shape[2], args[0].shape[3])
         return None
 
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
-
-
-
-
-
 
 
 
@@ -186,7 +297,10 @@ def apply_patch(
         use_rand: bool = True,
         merge_attn: bool = True,
         merge_crossattn: bool = False,
-        merge_mlp: bool = False):
+        merge_mlp: bool = False,
+        ratio_start: float = 0,
+        ratio_end: float = 0,
+        save_dir: str = None):
     """
     Patches a stable diffusion model with ToMe.
     Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
@@ -222,12 +336,17 @@ def apply_patch(
         diffusion_model = model.model.diffusion_model
     else:
         # Supports "pipe.unet" and "unet"
-        diffusion_model = model.unet if hasattr(model, "unet") else model
+        diffusion_model = model.unet if hasattr(model, "unet") else model.transformer if hasattr(model, "transformer") else model
 
     diffusion_model._tome_info = {
         "size": None,
         "hooks": [],
+        "size": (),
+        "save_dir" : save_dir,
         "args": {
+            "step": 0,
+            "ratio_start": ratio_start,
+            "ratio_end": ratio_end,
             "ratio": ratio,
             "max_downsample": max_downsample,
             "sx": sx, "sy": sy,
@@ -255,17 +374,18 @@ def apply_patch(
             if not hasattr(module, "use_ada_layer_norm_zero") and is_diffusers:
                 module.use_ada_layer_norm = False
                 module.use_ada_layer_norm_zero = False
+        if isinstance_str(module, "JointTransformerBlock"):
+            make_tome_block_fn = make_diffusers_tome_block_mmdit if is_diffusers else make_tome_block
+            module.__class__ = make_tome_block_fn(module.__class__)
+            module._tome_info = diffusion_model._tome_info
 
     return model
-
-
-
 
 
 def remove_patch(model: torch.nn.Module):
     """ Removes a patch from a ToMe Diffusion module if it was already patched. """
     # For diffusers
-    model = model.unet if hasattr(model, "unet") else model
+    model = model.unet if hasattr(model, "unet") else model.transformer if hasattr(model, "transformer") else model
 
     for _, module in model.named_modules():
         if hasattr(module, "_tome_info"):

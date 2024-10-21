@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1,2 torchrun --nnodes=1 --nproc_per_node=2 /data1/fanghaipeng/project/sora/DiT/sample_ddp.py --model DiT-XL/2 --num-fid-samples 50000 --sample-dir /data1/fanghaipeng/project/sora/tomesd/DiT/samples --image-size 512
