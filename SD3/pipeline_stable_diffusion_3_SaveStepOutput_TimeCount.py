@@ -903,7 +903,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                             module._tome_info["args"]["ratio"] = ratio_stepi
                             module._tome_info["args"]["step"] = i
                     ratio_time=time.time() - start_time
-                    print("RATIO_TIME",ratio_time * 50)
+                    # print("RATIO_TIME",ratio_time * 50)
 
                 # if hasattr(self.transformer, "_tome_info"):
                 #     self.transformer._tome_info["size"] = (latents.shape[2] // self.transformer.config.patch_size, latents.shape[3] // self.transformer.config.patch_size)

@@ -29,7 +29,7 @@
 #     --ratio-end 1 \
 
 
-CUDA_VISIBLE_DEVICES=5,6 torchrun \
+CUDA_VISIBLE_DEVICES=6,7 torchrun \
     --master_port=28888 --nnodes=1 --nproc_per_node=2 \
     sample_ddp.py \
     --caption-path /data/fanghaipeng/datasets/COCO2017/annotations/captions_val2017.json \
@@ -42,8 +42,9 @@ CUDA_VISIBLE_DEVICES=5,6 torchrun \
     --batch-size 8 \
     --ratio 0.5 \
     --ratio-start 0.5 \
-    --ratio-end 0.5 \
+    --ratio-end 1 \
     --prune-replace \
+    --replace-step 30 \
 
 # export CUDA_VISIBLE_DEVICES=1
 # python -m debugpy \

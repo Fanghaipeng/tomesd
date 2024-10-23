@@ -83,7 +83,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     B, N, _ = metric.shape
 
     if r <= 0:
-        return do_nothing, do_nothing
+        return do_nothing, do_nothing, do_nothing
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
     
@@ -151,7 +151,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
         return torch.cat([unm, dst], dim=1)
 
-    def prune(x: torch.Tensor, mode="mean") -> torch.Tensor:
+    def mprune(x: torch.Tensor) -> torch.Tensor:
         src, dst = split(x)
         n, t1, c = src.shape
         
@@ -173,7 +173,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
         return out
     
-    return merge, unmerge, prune
+    return merge, mprune, unmerge
 
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
@@ -197,15 +197,15 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
         # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
         # batch, which causes artifacts with use_rand, so force it to be off.
         use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-        m, u, p = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
+        m, mp, u  = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
                                                       no_rand=not use_rand, generator=args["generator"])
     else:
         m, u = (do_nothing, do_nothing)
 
     if args["prune_replace"] and args["step"] >= args["replace_step"]:
-        m_a, u_a = (p, u) if args["merge_attn"]      else (do_nothing, do_nothing)
-        m_c, u_c = (p, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
-        m_m, u_m = (p, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
+        m_a, u_a = (mp, u) if args["merge_attn"]      else (do_nothing, do_nothing)
+        m_c, u_c = (mp, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
+        m_m, u_m = (mp, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
     else:
         m_a, u_a = (m, u) if args["merge_attn"]      else (do_nothing, do_nothing)
         m_c, u_c = (m, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
