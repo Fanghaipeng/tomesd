@@ -7,9 +7,10 @@ import torch.multiprocessing as mp
 import os
 
 from tqdm import tqdm
-from tome import apply_patch_tome
-from tome_STD import apply_patch_ToMe_STD
-from diffusers import StableDiffusion3Pipeline
+from tome import apply_patch_tome, show_timing_info
+from tome_ours import apply_patch_ToMe_STD
+# from diffusers import StableDiffusion3Pipeline
+from pipeline_stable_diffusion_3_SaveStepOutput_TimeCount import StableDiffusion3Pipeline
 
 import time
 
@@ -113,15 +114,14 @@ def main(args):
     if args.tome_type == "default":
         pipe = pipe
     elif args.tome_type == "ToMe":
-        apply_patch_tome(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=2, sy=2, \
-            save_dir=output_path, prune_replace=args.prune_replace, replace_step=args.replace_step, merge_x=args.merge_x, \
-            trace_source=args.trace_source)
+        apply_patch_tome(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=4, sy=4, \
+            save_dir=output_path, prune_replace=args.prune_replace, replace_step=args.replace_step, merge_x=args.merge_x)
     elif args.tome_type == "ToMe_STD":
-        apply_patch_ToMe_STD(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=2, sy=2, \
+        apply_patch_ToMe_STD(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=4, sy=4, \
             save_dir=output_path, prune_replace=args.prune_replace, replace_step=args.replace_step, merge_x=args.merge_x)
 
     if args.speed_test:
-        test_time = 10
+        test_time = 2
         start_time = time.time()
         for i in tqdm(range(0, test_time), desc=f"Rank {rank}"):
             batch_captions = local_captions_list[i: i + batch_size]
@@ -135,17 +135,13 @@ def main(args):
                 width=args.width,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
+                save_step=args.save_step,
+                speed_test=args.speed_test
             ).images
         image_time = time.time() - start_time
         print(f"Total image for {test_time} batch time spent: {image_time} seconds")
-        
-        if args.tome_type == "ToMe":
-            from tome import show_timing_info
-        elif args.tome_type == "ToMe_STD":
-            from tome_STD import show_timing_info
-
         show_timing_info()
-
+        
         return
 
     for i in tqdm(range(0, len(local_captions_list), batch_size), desc=f"Rank {rank}"):
@@ -187,7 +183,6 @@ if __name__ == "__main__":
     parser.add_argument("--speed-test", type=bool, default=False)
     parser.add_argument("--merge-x", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--prune-replace", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--trace-source", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--replace-step", type=int, default=0)
     args = parser.parse_args()
     main(args)

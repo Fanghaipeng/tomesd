@@ -8,16 +8,14 @@ import random
 import time
 from tabulate import tabulate
 
-time_norm1 = 0
-time_compute_merge = 0
-time_contextnorm = 0
-time_merge_attn = 0
-time_attn = 0
-time_unmerge_attn = 0
-time_norm2 = 0
-time_merge_mlp = 0
-time_mlp = 0
-time_unmerge_mlp = 0
+TIME_OTHERS = 0
+TIME_COMPUTE_MERGE = 0
+TIME_MERGE_ATTN = 0
+TIME_ATTN = 0
+TIME_UNMERGE_ATTN = 0
+TIME_MERGE_MLP = 0
+TIME_MLP = 0
+TIME_UNMERGE_MLP = 0
 
 def do_nothing(x: torch.Tensor, mode:str=None):
     return x
@@ -83,7 +81,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     B, N, _ = metric.shape
 
     if r <= 0:
-        return do_nothing, do_nothing
+        return do_nothing, do_nothing, do_nothing
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
     
@@ -151,6 +149,14 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
         return torch.cat([unm, dst], dim=1)
 
+    def mprune(x: torch.Tensor) -> torch.Tensor:
+        src, dst = split(x)
+        n, t1, c = src.shape
+        
+        unm = gather(src, dim=-2, index=unm_idx.expand(n, t1 - r, c))
+
+        return torch.cat([unm, dst], dim=1)
+    
     def unmerge(x: torch.Tensor) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
@@ -163,153 +169,41 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
-
         return out
-
-    return merge, unmerge
+    
+    return merge, mprune, unmerge
 
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
-    original_h, original_w = tome_info["size"]
-    original_tokens = original_h * original_w
-    downsample = int(math.ceil(math.sqrt(original_tokens // x.shape[1])))
-
     args = tome_info["args"]
 
-    if downsample <= args["max_downsample"]:
-        w = int(math.ceil(original_w / downsample))
-        h = int(math.ceil(original_h / downsample))
-        r = int(x.shape[1] * args["ratio"])
+    w = int(math.sqrt(x.shape[1]))
+    h = w
+    assert w * h == x.shape[1], "Input must be square"
+    r = int(x.shape[1] * args["ratio"])
 
-        # Re-init the generator if it hasn't already been initialized or device has changed.
-        if args["generator"] is None:
-            args["generator"] = init_generator(x.device)
-        elif args["generator"].device != x.device:
-            args["generator"] = init_generator(x.device, fallback=args["generator"])
-        
-        # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
-        # batch, which causes artifacts with use_rand, so force it to be off.
-        use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-        m, u = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
-                                                      no_rand=not use_rand, generator=args["generator"])
+    # Re-init the generator if it hasn't already been initialized or device has changed.
+    if args["generator"] is None:
+        args["generator"] = init_generator(x.device)
+    elif args["generator"].device != x.device:
+        args["generator"] = init_generator(x.device, fallback=args["generator"])
+    
+    # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
+    # batch, which causes artifacts with use_rand, so force it to be off.
+    use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
+    m, mp, u  = bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
+                                                    no_rand=not use_rand, generator=args["generator"])
+
+    if args["prune_replace"] and args["step"] >= args["replace_step"]:
+        m_a, u_a = (mp, u) if args["merge_attn"]      else (do_nothing, do_nothing)
+        m_c, u_c = (mp, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
+        m_m, u_m = (mp, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
     else:
-        m, u = (do_nothing, do_nothing)
-
-    m_a, u_a = (m, u) if args["merge_attn"]      else (do_nothing, do_nothing)
-    m_c, u_c = (m, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
-    m_m, u_m = (m, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
+        m_a, u_a = (m, u) if args["merge_attn"]      else (do_nothing, do_nothing)
+        m_c, u_c = (m, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
+        m_m, u_m = (m, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
 
     return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
-
-
-def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    """
-    Make a patched class on the fly so we don't have to import any specific modules.
-    This patch applies ToMe to the forward function of the block.
-    """
-
-    class ToMeBlock(block_class):
-        # Save for unpatching later
-        _parent = block_class
-
-        def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info)
-
-            # This is where the meat of the computation happens
-            x = u_a(self.attn1(m_a(self.norm1(x)), context=context if self.disable_self_attn else None)) + x
-            x = u_c(self.attn2(m_c(self.norm2(x)), context=context)) + x
-            x = u_m(self.ff(m_m(self.norm3(x)))) + x
-
-            return x
-    
-    return ToMeBlock
-
-
-def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    """
-    Make a patched class for a diffusers model.
-    This patch applies ToMe to the forward function of the block.
-    """
-    class ToMeBlock(block_class):
-        # Save for unpatching later
-        _parent = block_class
-
-        def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            timestep=None,
-            cross_attention_kwargs=None,
-            class_labels=None,
-        ) -> torch.Tensor:
-            # (1) ToMe
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(hidden_states, self._tome_info)
-
-            if self.use_ada_layer_norm:
-                norm_hidden_states = self.norm1(hidden_states, timestep)
-            elif self.use_ada_layer_norm_zero:
-                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
-                )
-            else:
-                norm_hidden_states = self.norm1(hidden_states)
-
-            # (2) ToMe m_a
-            norm_hidden_states = m_a(norm_hidden_states)
-
-            # 1. Self-Attention
-            cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
-            attn_output = self.attn1(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-                attention_mask=attention_mask,
-                **cross_attention_kwargs,
-            )
-            if self.use_ada_layer_norm_zero:
-                attn_output = gate_msa.unsqueeze(1) * attn_output
-
-            # (3) ToMe u_a
-            hidden_states = u_a(attn_output) + hidden_states
-
-            if self.attn2 is not None:
-                norm_hidden_states = (
-                    self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
-                )
-                # (4) ToMe m_c
-                norm_hidden_states = m_c(norm_hidden_states)
-
-                # 2. Cross-Attention
-                attn_output = self.attn2(
-                    norm_hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=encoder_attention_mask,
-                    **cross_attention_kwargs,
-                )
-                # (5) ToMe u_c
-                hidden_states = u_c(attn_output) + hidden_states
-
-            # 3. Feed-forward
-            norm_hidden_states = self.norm3(hidden_states)
-            
-            if self.use_ada_layer_norm_zero:
-                norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-
-            # (6) ToMe m_m
-            norm_hidden_states = m_m(norm_hidden_states)
-
-            ff_output = self.ff(norm_hidden_states)
-
-            if self.use_ada_layer_norm_zero:
-                ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-            # (7) ToMe u_m
-            hidden_states = u_m(ff_output) + hidden_states
-
-            return hidden_states
-
-    return ToMeBlock
 
 
 def average_cosine_similarity(hidden_states):
@@ -325,121 +219,17 @@ def average_cosine_similarity(hidden_states):
     
     return average_similarity
 
-
-# def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-#     """
-#     Make a patched class for a diffusers model.
-#     This patch applies ToMe to the forward function of the block.
-#     """
-#     class JointTransformerBlock_ToMe(block_class):
-#         # Save for unpatching later
-#         _parent = block_class
-
-#         def forward(
-#             self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor
-#         ):  
-            
-#             # # 计算初始hidden_states的平均余弦相似度
-#             # average_sim = average_cosine_similarity(hidden_states)
-            
-#             # # 将相似度写入文件
-#             # with open("/data1/fanghaipeng/project/sora/tomesd/tomesd/average_cosine_similarity.txt", "a") as file:
-#             #     file.write(f"{average_sim.item()}\n")
-#             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-            
-#             # (1) ToMe
-#             m_a, _, m_m, u_a, _, u_m = compute_merge(norm_hidden_states, self._tome_info)
-#             if self.context_pre_only:
-#                 norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states, temb)
-#             else:
-#                 norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-#                     encoder_hidden_states, emb=temb
-#                 )
-
-#             # (2) ToMe m_a
-            
-#             norm_hidden_states = m_a(norm_hidden_states)
-
-#             # Attention.
-#             attn_output, context_attn_output = self.attn(
-#                 hidden_states=norm_hidden_states, encoder_hidden_states=norm_encoder_hidden_states
-#             )
-
-#             # Process attention outputs for the `hidden_states`.
-#             attn_output = gate_msa.unsqueeze(1) * attn_output
-
-#             # (3) ToMe u_a
-#             hidden_states = hidden_states + u_a(attn_output)
-            
-#             norm_hidden_states = self.norm2(hidden_states)
-#             norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-
-#             # (4) ToMe m_m
-#             norm_hidden_states = m_m(norm_hidden_states)
-
-#             if self._chunk_size is not None:
-#                 # "feed_forward_chunk_size" can be used to save memory
-#                 ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
-#             else:
-#                 ff_output = self.ff(norm_hidden_states)
-#             ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-#             # (5) ToMe u_m
-#             hidden_states = hidden_states + u_m(ff_output)
-
-#             # Process attention outputs for the `encoder_hidden_states`.
-#             if self.context_pre_only:
-#                 encoder_hidden_states = None
-#             else:
-#                 context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-#                 encoder_hidden_states = encoder_hidden_states + context_attn_output
-
-#                 norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-#                 norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
-#                 if self._chunk_size is not None:
-#                     # "feed_forward_chunk_size" can be used to save memory
-#                     context_ff_output = _chunked_feed_forward(
-#                         self.ff_context, norm_encoder_hidden_states, self._chunk_dim, self._chunk_size
-#                     )
-#                 else:
-#                     context_ff_output = self.ff_context(norm_encoder_hidden_states)
-#                 encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
-
-#             return encoder_hidden_states, hidden_states
-
-#     return JointTransformerBlock_ToMe
-
-# def show_timing_info():
-#     # 创建一个列表，包含所有时间数据和相应的标签
-#     data = [
-#         ["Normalization 1", norm1],
-#         ["Compute Merge", compute_merge],
-#         ["Context Normalization", contextnorm],
-#         ["Merge Attention", merge_attn],
-#         ["Attention", attn],
-#         ["Unmerge Attention", unmerge_attn],
-#         ["Normalization 2", norm2],
-#         ["Merge MLP", merge_mlp],
-#         ["MLP", mlp],
-#         ["Unmerge MLP", unmerge_mlp]
-#     ]
-
-#     # 使用 tabulate 打印表格，选择 "grid" 格式使表格更易读
-#     print(tabulate(data, headers=['Operation', 'Time (seconds)'], tablefmt='grid'))
-
 def show_timing_info():
     # 创建一个列表，包含所有时间数据和相应的标签
     data = [
-        ["Norm", time_norm1 + time_norm2],
-        ["Norm_Context", time_contextnorm],
-        ["Compute Merge", time_compute_merge],
-        ["Merge Attention", time_merge_attn],
-        ["Attention", time_attn],
-        ["Unmerge Attention", time_unmerge_attn],
-        ["Normalization 2", time_norm2],
-        ["Merge MLP", time_merge_mlp],
-        ["MLP", time_mlp],
-        ["Unmerge MLP", time_unmerge_mlp]
+        ["Norm and Res", TIME_OTHERS],
+        ["Compute Merge", TIME_COMPUTE_MERGE],
+        ["Merge Attention", TIME_MERGE_ATTN],
+        ["Attention", TIME_ATTN],
+        ["Unmerge Attention", TIME_UNMERGE_ATTN],
+        ["Merge MLP", TIME_MERGE_MLP],
+        ["MLP", TIME_MLP],
+        ["Unmerge MLP", TIME_UNMERGE_MLP]
     ]
 
     # 使用 tabulate 打印表格，选择 "grid" 格式使表格更易读
@@ -450,23 +240,24 @@ def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[
     Make a patched class for a diffusers model.
     This patch applies ToMe to the forward function of the block.
     """
-    class JointTransformerBlock_ToMe_Once(block_class):
+    class JointTransformerBlock_ToMe(block_class):
         # Save for unpatching later
         _parent = block_class
         # Global variables for timing
         def forward(
             self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor
         ):  
-            global time_norm1, time_compute_merge, time_contextnorm, time_merge_attn, time_attn, time_unmerge_attn, \
-                    time_norm2, time_merge_mlp, time_mlp, time_unmerge_mlp
+            global TIME_OTHERS, TIME_COMPUTE_MERGE, TIME_MERGE_ATTN, TIME_ATTN, TIME_UNMERGE_ATTN, \
+                    TIME_MERGE_MLP, TIME_MLP, TIME_UNMERGE_MLP
+            
             start_time = time.time()
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-            time_norm1 += time.time() - start_time
+            TIME_OTHERS += time.time() - start_time
             
             # (1) ToMe
             start_time = time.time()
             m_a, _, m_m, u_a, _, u_m = compute_merge(norm_hidden_states, self._tome_info)
-            time_compute_merge += time.time() - start_time
+            TIME_COMPUTE_MERGE += time.time() - start_time
 
             start_time = time.time()
             if self.context_pre_only:
@@ -475,12 +266,12 @@ def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[
                 norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
                     encoder_hidden_states, emb=temb
                 )
-            time_contextnorm += time.time() - start_time
+            TIME_OTHERS += time.time() - start_time
 
             # (2) ToMe m_a
             start_time = time.time()
             norm_hidden_states = m_a(norm_hidden_states)
-            time_merge_attn += time.time() - start_time
+            TIME_MERGE_ATTN += time.time() - start_time
             
             # Attention.
             start_time = time.time()
@@ -488,24 +279,27 @@ def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[
                 hidden_states=norm_hidden_states, encoder_hidden_states=norm_encoder_hidden_states
             )
             # Process attention outputs for the `hidden_states`.
+            TIME_ATTN += time.time() - start_time
+            
+            start_time = time.time()
             attn_output = gate_msa.unsqueeze(1) * attn_output
-            time_attn += time.time() - start_time
+            TIME_OTHERS += time.time() - start_time
 
             # (3) ToMe u_a
             start_time = time.time()
             attn_output = u_a(attn_output)
-            time_unmerge_attn += time.time() - start_time
+            TIME_UNMERGE_ATTN += time.time() - start_time
             hidden_states = hidden_states + attn_output
 
             start_time = time.time()
             norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-            time_norm2 += time.time() - start_time
+            TIME_OTHERS += time.time() - start_time
 
             # (4) ToMe m_m
             start_time = time.time()
             norm_hidden_states = m_m(norm_hidden_states)
-            time_merge_mlp += time.time() - start_time
+            TIME_MERGE_MLP += time.time() - start_time
 
             start_time = time.time()
             if self._chunk_size is not None:
@@ -513,13 +307,16 @@ def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[
                 ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
             else:
                 ff_output = self.ff(norm_hidden_states)
+            TIME_MLP += time.time() - start_time
+
+            start_time = time.time()
             ff_output = gate_mlp.unsqueeze(1) * ff_output
-            time_mlp += time.time() - start_time
+            TIME_OTHERS += time.time() - start_time
 
             # (5) ToMe u_m
             start_time = time.time()
             ff_output = u_m(ff_output)
-            time_unmerge_mlp += time.time() - start_time
+            TIME_UNMERGE_MLP += time.time() - start_time
 
             hidden_states = hidden_states + ff_output
 
@@ -541,10 +338,11 @@ def make_diffusers_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[
                 else:
                     context_ff_output = self.ff_context(norm_encoder_hidden_states)
                 encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
-            time_contextnorm += time.time() - start_time
+            TIME_OTHERS += time.time() - start_time
+            
             return encoder_hidden_states, hidden_states
 
-    return JointTransformerBlock_ToMe_Once
+    return JointTransformerBlock_ToMe
 
 def hook_tome_model(model: torch.nn.Module):
     """ Adds a forward pre hook to get the image size. This hook can be removed with remove_patch. """
@@ -561,7 +359,6 @@ def hook_tome_model(model: torch.nn.Module):
 def apply_patch_tome(
         model: torch.nn.Module,
         ratio: float = 0.5,
-        max_downsample: int = 1,
         sx: int = 2, sy: int = 2,
         use_rand: bool = True,
         merge_attn: bool = True,
@@ -569,7 +366,10 @@ def apply_patch_tome(
         merge_mlp: bool = False,
         ratio_start: float = 0,
         ratio_end: float = 0,
-        save_dir: str = None):
+        save_dir: str = None,
+        prune_replace: bool = False,
+        replace_step: int = 0,
+        merge_x: bool = False):
     """
     Patches a stable diffusion model with ToMe.
     Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
@@ -595,17 +395,7 @@ def apply_patch_tome(
 
     # Make sure the module is not currently patched
     remove_patch(model)
-
-    is_diffusers = isinstance_str(model, "DiffusionPipeline") or isinstance_str(model, "ModelMixin")
-
-    if not is_diffusers:
-        if not hasattr(model, "model") or not hasattr(model.model, "diffusion_model"):
-            # Provided model not supported
-            raise RuntimeError("Provided model was not a Stable Diffusion / Latent Diffusion model, as expected.")
-        diffusion_model = model.model.diffusion_model
-    else:
-        # Supports "pipe.unet" and "pipe.transformer" and "unet" and "transformer" 
-        diffusion_model = model.unet if hasattr(model, "unet") else model.transformer if hasattr(model, "transformer") else model
+    diffusion_model = model.transformer
 
     diffusion_model._tome_info = {
         "hooks": [],
@@ -616,34 +406,24 @@ def apply_patch_tome(
             "ratio_start": ratio_start,
             "ratio_end": ratio_end,
             "ratio": ratio,
-            "max_downsample": max_downsample,
+            "step_ratio": ratio,
             "sx": sx, "sy": sy,
             "use_rand": use_rand,
             "generator": None,
             "merge_attn": merge_attn,
             "merge_crossattn": merge_crossattn,
-            "merge_mlp": merge_mlp
+            "merge_mlp": merge_mlp,
+            "merge_x": merge_x, 
+            "prune_replace": prune_replace,
+            "replace_step": replace_step,
         }
     }
     hook_tome_model(diffusion_model)
 
     for _, module in diffusion_model.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
-        if isinstance_str(module, "BasicTransformerBlock"):
-            make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
-            module.__class__ = make_tome_block_fn(module.__class__)
-            module._tome_info = diffusion_model._tome_info
-
-            # Something introduced in SD 2.0 (LDM only)
-            if not hasattr(module, "disable_self_attn") and not is_diffusers:
-                module.disable_self_attn = False
-
-            # Something needed for older versions of diffusers
-            if not hasattr(module, "use_ada_layer_norm_zero") and is_diffusers:
-                module.use_ada_layer_norm = False
-                module.use_ada_layer_norm_zero = False
         if isinstance_str(module, "JointTransformerBlock"):
-            make_tome_block_fn = make_diffusers_tome_block_mmdit if is_diffusers else make_tome_block
+            make_tome_block_fn = make_diffusers_tome_block_mmdit
             module.__class__ = make_tome_block_fn(module.__class__)
             module._tome_info = diffusion_model._tome_info
 
