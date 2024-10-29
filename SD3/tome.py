@@ -7,17 +7,29 @@ from diffusers.models.attention import _chunked_feed_forward
 import random
 import time
 from tabulate import tabulate
-from merge import do_nothing, merge_wavg, merge_source, global_merge_1d, global_merge_2d, local_merge_2d
+from merge import do_nothing, merge_wavg, merge_source, global_merge_1d, global_merge_2d, local_merge_2d, local_merge_2d_random
+# from fvcore.nn import FlopCountAnalysis, parameter_count_table, flop_count_table
+from diffusers.pipelines.stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
+from typing import Any, Callable, Dict, List, Optional, Union
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
+import os
+from diffusers.utils import (
+    USE_PEFT_BACKEND,
+    is_torch_xla_available,
+    logging,
+    replace_example_docstring,
+    scale_lora_layers,
+    unscale_lora_layers,
+)
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
 
-TIME_OTHERS = 0
-TIME_COMPUTE_MERGE = 0
-TIME_MERGE_ATTN = 0
-TIME_ATTN = 0
-TIME_UNMERGE_ATTN = 0
-TIME_MERGE_MLP = 0
-TIME_MLP = 0
-TIME_UNMERGE_MLP = 0
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
+from counter import TIME_OTHERS, TIME_COMPUTE_MERGE, TIME_MERGE_ATTN, TIME_ATTN, TIME_UNMERGE_ATTN, TIME_MERGE_MLP, TIME_MLP, TIME_UNMERGE_MLP
+    
 def isinstance_str(x: object, cls_name: str):
     """
     Checks whether x has any class *named* cls_name in its ancestry.
@@ -66,8 +78,12 @@ def compute_ratio(tome_info):
     ratio_start = tome_info["args"]["ratio_start"]
     ratio_end = tome_info["args"]["ratio_end"]
     step_count = tome_info["step_count"]
+    if "step_tmp_force" in tome_info:
+        tome_info["step_tmp"] = tome_info["step_tmp_force"]
     step_tmp = tome_info["step_tmp"]
     ratio_tmp = 1 - (ratio_start + (ratio_end - ratio_start) / (step_count - 1) * step_tmp) # ratio 是裁剪ratio，1 - 好理解
+    # print(step_tmp)
+    # print(ratio_tmp)
     return ratio_tmp
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
@@ -90,12 +106,16 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
     # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
     # batch, which causes artifacts with use_rand, so force it to be off.
     use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-    # m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
-    #                                                 no_rand=not use_rand, generator=args["generator"])
-    # m, mp, u  = global_merge_1d(metric=x, layer_idx=tome_info["layer_tmp"], reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"])
-    m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], window_size=(args["sx"], args["sy"]))
+    # m, mp, u  = global_merge_1d(metric=x, layer_idx=tome_info["layer_tmp"], reduce_num=reduce_num, 
+    #                             no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+    # m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], 
+    #                            window_size=(args["sx"], args["sy"]), tome_info=tome_info)
+    # m, mp, u  = local_merge_2d_random(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], 
+    #                                   window_size=(args["sx"], args["sy"]), tome_info=tome_info)
+    m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+                                    no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
 
-    if args["prune_replace"] and args["step"] >= args["replace_step"]:
+    if args["prune_replace"] and args["step"] >= args["STD_step"]:
         m_a, u_a = (mp, u) if args["merge_attn"]      else (do_nothing, do_nothing)
         m_c, u_c = (mp, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
         m_m, u_m = (mp, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
@@ -106,21 +126,8 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
 
     return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
 
-def show_timing_info():
-    # 创建一个列表，包含所有时间数据和相应的标签
-    data = [
-        ["Norm and Res", TIME_OTHERS],
-        ["Compute Merge", TIME_COMPUTE_MERGE],
-        ["Merge Attention", TIME_MERGE_ATTN],
-        ["Attention", TIME_ATTN],
-        ["Unmerge Attention", TIME_UNMERGE_ATTN],
-        ["Merge MLP", TIME_MERGE_MLP],
-        ["MLP", TIME_MLP],
-        ["Unmerge MLP", TIME_UNMERGE_MLP]
-    ]
 
-    # 使用 tabulate 打印表格，选择 "grid" 格式使表格更易读
-    print(tabulate(data, headers=['Operation', 'Time (seconds)'], tablefmt='grid'))
+
 
 def make_tome_pipe(pipe_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
@@ -133,7 +140,8 @@ def make_tome_pipe(pipe_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             self._tome_info["step_count"] = kwargs['num_inference_steps']
             self._tome_info["step_iter"] = list(range(kwargs['num_inference_steps']))
             self.transformer._tome_info = self._tome_info
-            return super().__call__(*args, **kwargs)
+            output = super().__call__(*args, **kwargs)
+            return output
 
     return StableDiffusion3Pipeline_ToMe
 
@@ -147,8 +155,8 @@ def make_tome_mmdit(model_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
             self._tome_info["layer_count"] = self.config.num_layers
             self._tome_info["step_tmp"] = self._tome_info["step_iter"].pop(0)
             self._tome_info["layer_iter"] = list(range(self.config.num_layers))
-
-            return super().forward(*args, **kwargs)
+            output = super().forward(*args, **kwargs)
+            return output
 
     return SD3Transformer2DModel_ToMe
 
@@ -268,7 +276,7 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
 
     return JointTransformerBlock_ToMe
 
-def apply_patch_tome(
+def apply_patch_ToMe(
         pipe: torch.nn.Module,
         ratio: float = 0.5,
         sx: int = 2, sy: int = 2,
@@ -282,7 +290,8 @@ def apply_patch_tome(
         save_dir: str = None,
         prune_replace: bool = False,
         trace_source: bool = False,
-        replace_step: int = 0):
+        STD_step: int = 0,
+        speed_test: bool = False,):
     """
     Patches a stable diffusion model with ToMe.
     Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
@@ -318,6 +327,7 @@ def apply_patch_tome(
         "layer_iter": None,
         "layer_tmp": None,
         "source": [],
+        "profiler": None,
         "args": {
             "save_dir" : save_dir,
             "ratio_start": ratio_start,
@@ -331,8 +341,9 @@ def apply_patch_tome(
             "merge_mlp": merge_mlp,
             "merge_x": merge_x, 
             "prune_replace": prune_replace,
-            "replace_step": replace_step,
+            "STD_step": STD_step,
             "trace_source": trace_source,
+            "speed_test": speed_test,
         }
     }
     mmdit = pipe.transformer
@@ -347,3 +358,305 @@ def apply_patch_tome(
     return pipe
 
 
+# def make_tome_pipe(pipe_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+#     # change forward to save stepimage and compute flops
+#     class StableDiffusion3Pipeline_ToMe(pipe_class):
+#         # Save for unpatching later
+#         _parent = pipe_class
+#         # Global variables for timing
+
+#         def __call__(self,
+#         prompt: Union[str, List[str]] = None,
+#         prompt_2: Optional[Union[str, List[str]]] = None,
+#         prompt_3: Optional[Union[str, List[str]]] = None,
+#         height: Optional[int] = None,
+#         width: Optional[int] = None,
+#         num_inference_steps: int = 28,
+#         timesteps: List[int] = None,
+#         guidance_scale: float = 7.0,
+#         negative_prompt: Optional[Union[str, List[str]]] = None,
+#         negative_prompt_2: Optional[Union[str, List[str]]] = None,
+#         negative_prompt_3: Optional[Union[str, List[str]]] = None,
+#         num_images_per_prompt: Optional[int] = 1,
+#         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+#         latents: Optional[torch.FloatTensor] = None,
+#         prompt_embeds: Optional[torch.FloatTensor] = None,
+#         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+#         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+#         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+#         output_type: Optional[str] = "pil",
+#         return_dict: bool = True,
+#         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+#         clip_skip: Optional[int] = None,
+#         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+#         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+#         max_sequence_length: int = 256,
+#         save_step: bool = False,
+#         speed_test: bool = False):
+
+#             # 更新自己及孩子的tome_info
+#             self._tome_info["step_count"] = num_inference_steps
+#             self._tome_info["step_iter"] = list(range(num_inference_steps))
+#             self.transformer._tome_info = self._tome_info
+
+#             height = height or self.default_sample_size * self.vae_scale_factor
+#             width = width or self.default_sample_size * self.vae_scale_factor
+
+#             # 1. Check inputs. Raise error if not correct
+#             self.check_inputs(
+#                 prompt,
+#                 prompt_2,
+#                 prompt_3,
+#                 height,
+#                 width,
+#                 negative_prompt=negative_prompt,
+#                 negative_prompt_2=negative_prompt_2,
+#                 negative_prompt_3=negative_prompt_3,
+#                 prompt_embeds=prompt_embeds,
+#                 negative_prompt_embeds=negative_prompt_embeds,
+#                 pooled_prompt_embeds=pooled_prompt_embeds,
+#                 negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+#                 callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+#                 max_sequence_length=max_sequence_length,
+#             )
+
+#             self._guidance_scale = guidance_scale
+#             self._clip_skip = clip_skip
+#             self._joint_attention_kwargs = joint_attention_kwargs
+#             self._interrupt = False
+
+#             # 2. Define call parameters
+#             if prompt is not None and isinstance(prompt, str):
+#                 batch_size = 1
+#             elif prompt is not None and isinstance(prompt, list):
+#                 batch_size = len(prompt)
+#             else:
+#                 batch_size = prompt_embeds.shape[0]
+
+#             device = self._execution_device
+
+#             lora_scale = (
+#                 self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
+#             )
+#             (
+#                 prompt_embeds,
+#                 negative_prompt_embeds,
+#                 pooled_prompt_embeds,
+#                 negative_pooled_prompt_embeds,
+#             ) = self.encode_prompt(
+#                 prompt=prompt,
+#                 prompt_2=prompt_2,
+#                 prompt_3=prompt_3,
+#                 negative_prompt=negative_prompt,
+#                 negative_prompt_2=negative_prompt_2,
+#                 negative_prompt_3=negative_prompt_3,
+#                 do_classifier_free_guidance=self.do_classifier_free_guidance,
+#                 prompt_embeds=prompt_embeds,
+#                 negative_prompt_embeds=negative_prompt_embeds,
+#                 pooled_prompt_embeds=pooled_prompt_embeds,
+#                 negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+#                 device=device,
+#                 clip_skip=self.clip_skip,
+#                 num_images_per_prompt=num_images_per_prompt,
+#                 max_sequence_length=max_sequence_length,
+#                 lora_scale=lora_scale,
+#             )
+
+#             if self.do_classifier_free_guidance:
+#                 prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+#                 pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+
+#             # 4. Prepare timesteps
+#             timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+#             num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+#             self._num_timesteps = len(timesteps)
+
+#             # 5. Prepare latent variables
+#             num_channels_latents = self.transformer.config.in_channels
+#             latents = self.prepare_latents(
+#                 batch_size * num_images_per_prompt,
+#                 num_channels_latents,
+#                 height,
+#                 width,
+#                 prompt_embeds.dtype,
+#                 device,
+#                 generator,
+#                 latents,
+#             )
+
+#             # 6. Denoising loop
+#             import time
+
+#             if save_step:
+#                 save_dir = self.transformer._tome_info["save_dir"]
+#                 os.makedirs(save_dir, exist_ok=True)
+#             # Start the timer manually
+#             each_time = []
+
+#             with self.progress_bar(total=num_inference_steps) as progress_bar:
+#                 for i, t in enumerate(timesteps):
+#                     if self.interrupt:
+#                         continue
+
+#                     # expand the latents if we are doing classifier free guidance
+#                     latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+#                     # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+#                     timestep = t.expand(latent_model_input.shape[0])
+
+#                     start_time = time.time()
+#                     if speed_test:
+#                         pass
+#                         #NOTE: fvcore
+#                         # from fvcore.nn import FlopCountAnalysis, flop_count_table
+#                         # # 实例化包装模块
+#                         # transformer_wrapper = TransformerWrapper(self.transformer)
+#                         # inputs = (
+#                         #     latent_model_input,
+#                         #     timestep,
+#                         #     prompt_embeds,
+#                         #     pooled_prompt_embeds,
+#                         #     self.joint_attention_kwargs,
+#                         #     return_dict,
+#                         # )
+#                         # flops = FlopCountAnalysis(transformer_wrapper, inputs)
+#                         # # flops = register_custom_flop_counters(flops)
+#                         # # 打印总的 GFLOPs
+#                         # print(f"Total FLOPs: {flops.total() / 1e9:.2f} GFLOPs")
+#                         # # 打印每个模块的 FLOPs 细节
+#                         # print(flop_count_table(flops))
+
+#                         #NOTE: ptflops
+#                         # from ptflops import get_model_complexity_info
+#                         # model_wrapper = TransformerDynamicWrapper(self.transformer, timestep, prompt_embeds, pooled_prompt_embeds, self.joint_attention_kwargs)
+                        
+#                         # # Calculate FLOPs using ptflops
+#                         # macs, params = get_model_complexity_info(model_wrapper, (latent_model_input.size(),), as_strings=False,
+#                         #                                         print_per_layer_stat=True, verbose=True)
+
+#                         # print(f"Model MACs (Multiply-Accumulate Operations): {macs}")
+#                         # print(f"Model Parameters: {params}")
+
+#                         #NOTE: deepcache
+#                         # from flops import count_ops_and_params
+#                         # example_inputs = {
+#                         #     'hidden_states': latent_model_input, 
+#                         #     'timestep': timestep,
+#                         #     'encoder_hidden_states': prompt_embeds,
+#                         #     'pooled_projections': pooled_prompt_embeds,
+#                         #     'joint_attention_kwargs': self.joint_attention_kwargs,
+#                         #     'return_dict': False,
+#                         # }
+#                         # macs, nparams = count_ops_and_params(self.transformer, example_inputs=example_inputs, layer_wise=False)
+#                         # print("#Params: {:.4f} M".format(nparams/1e6))
+#                         # print("#MACs: {:.4f} G".format(macs/1e9))
+
+#                         #NOTE: thop
+#                         # from thop import profile, clever_format
+#     #                         def forward(
+#                         #     self,
+#                         #     hidden_states: torch.FloatTensor,
+#                         #     encoder_hidden_states: torch.FloatTensor = None,
+#                         #     pooled_projections: torch.FloatTensor = None,
+#                         #     timestep: torch.LongTensor = None,
+#                         #     block_controlnet_hidden_states: List = None,
+#                         #     joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+#                         #     return_dict: bool = True,
+#                         # ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+#                         # transformer_wrapper = TransformerWrapper(self.transformer)
+#                         # inputs = (
+#                         #     latent_model_input,
+#                         #     prompt_embeds,
+#                         #     pooled_prompt_embeds,
+#                         #     timestep,
+#                         #     None,
+#                         #     self.joint_attention_kwargs,
+#                         #     False,
+#                         # )
+#                         # flops, params = profile(self.transformer, inputs=inputs, verbose=True)
+
+#                         # # 转换为GFLOPs
+#                         # gflops = flops / 1e9
+#                         # print(f"GFLOPS: {gflops:.2f} G")
+#                         # print(f"Total Parameters: {params}")
+#                         # # 代码执行完毕，清理变量
+#                         # del inputs, flops, params, gflops
+#                         # torch.cuda.empty_cache()  # 如果使用 GPU
+                        
+#                     noise_pred = self.transformer(
+#                         hidden_states=latent_model_input,
+#                         timestep=timestep,
+#                         encoder_hidden_states=prompt_embeds,
+#                         pooled_projections=pooled_prompt_embeds,
+#                         joint_attention_kwargs=self.joint_attention_kwargs,
+#                         return_dict=False,
+#                     )[0]
+                    
+#                     each_time.append(time.time() - start_time)
+
+#                     # perform guidance
+#                     if self.do_classifier_free_guidance:
+#                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+#                         noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+#                     # compute the previous noisy sample x_t -> x_t-1
+#                     latents_dtype = latents.dtype
+#                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+#                     if latents.dtype != latents_dtype:
+#                         if torch.backends.mps.is_available():
+#                             # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+#                             latents = latents.to(latents_dtype)
+
+#                     if callback_on_step_end is not None:
+#                         callback_kwargs = {}
+#                         for k in callback_on_step_end_tensor_inputs:
+#                             callback_kwargs[k] = locals()[k]
+#                         callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+#                         latents = callback_outputs.pop("latents", latents)
+#                         prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+#                         negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+#                         negative_pooled_prompt_embeds = callback_outputs.pop(
+#                             "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
+#                         )
+
+#                     # call the callback, if provided
+#                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+#                         progress_bar.update()
+
+#                     if XLA_AVAILABLE:
+#                         xm.mark_step()
+
+#                     # #! save every step
+#                     # if save_step:
+#                     #     latents_save = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+
+#                     #     image_save = self.vae.decode(latents_save, return_dict=False)[0]
+#                     #     image_save = self.image_processor.postprocess(image_save, output_type=output_type)
+#                     #     image_save[0].save(os.path.join(save_dir, f"{i}.png"))
+#             if speed_test:
+#                 # for i, iter_time in enumerate(each_time):
+#                 #     print(f"{i} spent: {iter_time:.3f} seconds")
+#                 avg_time = sum(each_time) / len(each_time)
+#                 print(f"Avg time spent: {avg_time} seconds")
+#                 total_time = sum(each_time)
+#                 print(f"Total time spent: {total_time} seconds")
+
+#             if output_type == "latent":
+#                 image = latents
+
+#             else:
+#                 latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+
+#                 image = self.vae.decode(latents, return_dict=False)[0]
+#                 image = self.image_processor.postprocess(image, output_type=output_type)
+
+#             # Offload all models
+#             self.maybe_free_model_hooks()
+
+#             if not return_dict:
+#                 return (image,)
+
+#             return StableDiffusion3PipelineOutput(images=image)
+
+#     return StableDiffusion3Pipeline_ToMe

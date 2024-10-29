@@ -36,9 +36,9 @@ ref_folder = "/data/fanghaipeng/datasets/COCO2017/val2017_centercrop_1024"
 # score = fid.compute_fid(ref_folder, image_folder, mode="clean")
 # print(f"The clean FID of ToMe 0.5 is: {score}")
 
-image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-tome-0.5-0.5-1.0_save"
-score = fid.compute_fid(ref_folder, image_folder, mode="clean")
-print(f"The clean FID of ToMe 0.5-1 is: {score}")
+# image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-tome-0.5-0.5-1.0_save"
+# score = fid.compute_fid(ref_folder, image_folder, mode="clean")
+# print(f"The clean FID of ToMe 0.5-1 is: {score}")
 
 # image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-tome-0.5-0.4-1.0"
 # score = fid.compute_fid(ref_folder, image_folder, mode="clean")
@@ -52,7 +52,16 @@ print(f"The clean FID of ToMe 0.5-1 is: {score}")
 # score = fid.compute_fid(ref_folder, image_folder, mode="clean")
 # print(f"The clean FID of ToMe 0.5 prune step 30 is: {score}")
 
-image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-ToMe-pruneTrue-step0-0.5-0.5-1.0"
+# image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-ToMe-pruneTrue-step0-0.5-0.5-1.0"
+# score = fid.compute_fid(ref_folder, image_folder, mode="clean")
+# print(f"The clean FID of ToMe 0.5-1 prune step 0 is: {score}")
+
+
+# image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-ToMe-pruneFalse-mergexFalse-step20-0.5-0.5-1.0"
+# score = fid.compute_fid(ref_folder, image_folder, mode="clean")
+# print(f"The clean FID of ToMe 0.5-1 prune step 0 is: {score}")
+
+
+image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-ToMe-pruneFalse-mergexFalse-step20-0.5-0.4-0.75"
 score = fid.compute_fid(ref_folder, image_folder, mode="clean")
 print(f"The clean FID of ToMe 0.5-1 prune step 0 is: {score}")
-

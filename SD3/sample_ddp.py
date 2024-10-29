@@ -7,10 +7,13 @@ import torch.multiprocessing as mp
 import os
 
 from tqdm import tqdm
-from tome import apply_patch_tome
+from tome import apply_patch_ToMe
+from counter import show_timing_info
 from tome_STD import apply_patch_ToMe_STD
-from diffusers import StableDiffusion3Pipeline
-
+# from diffusers import StableDiffusion3Pipeline
+from pipeline_stable_diffusion_3_SaveStepOutput_TimeCount import StableDiffusion3Pipeline
+from counter import MacTracker
+# from deepspeed.profiling.flops_profiler import FlopsProfiler
 import time
 
 import debugpy
@@ -87,7 +90,7 @@ def main(args):
     output_path = os.path.join(
         args.output_path,
         f"{pipe.__class__.__name__}-{args.height}-{args.width}-{args.num_inference_steps}-{args.guidance_scale}-{args.torch_dtype}-" \
-        f"{args.tome_type}-prune{args.prune_replace}-mergex{args.merge_x}-step{args.replace_step}-"
+        f"{args.tome_type}-prune{args.prune_replace}-mergex{args.merge_x}-step{args.STD_step}-"
         f"{args.ratio}-{args.ratio_start}-{args.ratio_end}"
     )
 
@@ -113,21 +116,22 @@ def main(args):
     if args.tome_type == "default":
         pipe = pipe
     elif args.tome_type == "ToMe":
-        apply_patch_tome(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=2, sy=2, \
-            save_dir=output_path, prune_replace=args.prune_replace, replace_step=args.replace_step, merge_x=args.merge_x, \
-            trace_source=args.trace_source)
+        apply_patch_ToMe(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=2, sy=2, \
+            save_dir=output_path, prune_replace=args.prune_replace, STD_step=args.STD_step, merge_x=args.merge_x, \
+            trace_source=args.trace_source, speed_test=args.speed_test)
     elif args.tome_type == "ToMe_STD":
         apply_patch_ToMe_STD(pipe, ratio=args.ratio, ratio_start=args.ratio_start, ratio_end=args.ratio_end, sx=2, sy=2, \
-            save_dir=output_path, prune_replace=args.prune_replace, replace_step=args.replace_step, merge_x=args.merge_x)
+            save_dir=output_path, prune_replace=args.prune_replace, STD_step=args.STD_step, merge_x=args.merge_x, \
+            trace_source=args.trace_source, speed_test=args.speed_test)
 
     if args.speed_test:
-        test_time = 10
+        test_time = 2
         start_time = time.time()
+
         for i in tqdm(range(0, test_time), desc=f"Rank {rank}"):
             batch_captions = local_captions_list[i: i + batch_size]
             prompt_list = [item['caption'] for item in batch_captions]
             id_list = [item['image_id'] for item in batch_captions]
-            
             images = pipe(
                 prompt=prompt_list,
                 generator=generator,
@@ -135,15 +139,13 @@ def main(args):
                 width=args.width,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
+                speed_test=True,
             ).images
         image_time = time.time() - start_time
         print(f"Total image for {test_time} batch time spent: {image_time} seconds")
-        
-        if args.tome_type == "ToMe":
-            from tome import show_timing_info
-        elif args.tome_type == "ToMe_STD":
-            from tome_STD import show_timing_info
-
+        mactracker = MacTracker.get_instance()
+        mactracker.show_step(test_time * args.batch_size)
+        mactracker.show_avg(test_time * args.batch_size)
         show_timing_info()
 
         return
@@ -188,6 +190,6 @@ if __name__ == "__main__":
     parser.add_argument("--merge-x", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--prune-replace", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trace-source", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--replace-step", type=int, default=0)
+    parser.add_argument("--STD-step", type=int, default=0)
     args = parser.parse_args()
     main(args)

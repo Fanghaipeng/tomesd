@@ -61,7 +61,8 @@ CUDA_VISIBLE_DEVICES=4 torchrun \
     --ratio 0.5 \
     --ratio-start 0.5 \
     --ratio-end 1 \
-    --trace-source
+    --trace-source \
+    --replace-step 20 \
 
 
 # CUDA_VISIBLE_DEVICES=4,5 torchrun \

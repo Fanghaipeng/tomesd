@@ -40,6 +40,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
 import os
+from counter import MacTracker
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -47,6 +48,9 @@ if is_torch_xla_available():
     XLA_AVAILABLE = True
 else:
     XLA_AVAILABLE = False
+
+from thop import profile, clever_format
+import copy
 
 import time
 
@@ -867,20 +871,6 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         )
 
         # 6. Denoising loop
-        #! New for ToMe
-        def isinstance_str(x: object, cls_name: str):
-            """
-            Checks whether x has any class *named* cls_name in its ancestry.
-            Doesn't require access to the class's implementation.
-            
-            Useful for patching!
-            """
-
-            for _cls in x.__class__.__mro__:
-                if _cls.__name__ == cls_name:
-                    return True
-            
-            return False
         import time
 
         if save_step:
@@ -892,26 +882,6 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
-                if hasattr(self.transformer, "_tome_info"):
-                    self.transformer._tome_info["size"] = (latents.shape[2] // self.transformer.config.patch_size, latents.shape[3] // self.transformer.config.patch_size)
-                    ratio_start = self.transformer._tome_info["args"]["ratio_start"]
-                    ratio_end = self.transformer._tome_info["args"]["ratio_end"]
-                    ratio_stepi = 1 - (ratio_start + (ratio_end - ratio_start) / (len(timesteps) - 1) * i)
-                    start_time = time.time()
-                    for _, module in self.transformer.named_modules():
-                        if isinstance_str(module, "JointTransformerBlock"):
-                            module._tome_info["args"]["ratio"] = ratio_stepi
-                            module._tome_info["args"]["step"] = i
-                    ratio_time=time.time() - start_time
-                    # print("RATIO_TIME",ratio_time * 50)
-
-                # if hasattr(self.transformer, "_tome_info"):
-                #     self.transformer._tome_info["size"] = (latents.shape[2] // self.transformer.config.patch_size, latents.shape[3] // self.transformer.config.patch_size)
-                #     ratio_start = self.transformer._tome_info["args"]["ratio_start"]
-                #     ratio_end = self.transformer._tome_info["args"]["ratio_end"]
-                #     ratio_stepi = 1 - (ratio_start + (ratio_end - ratio_start) / (len(timesteps) - 1) * i)
-                #     self.transformer._tome_info["args"]["step_ratio"] = ratio_stepi
-                #     self.transformer._tome_info["args"]["step"] = i
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
@@ -919,14 +889,82 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 timestep = t.expand(latent_model_input.shape[0])
 
                 start_time = time.time()
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
+                if speed_test:
+                        #NOTE: fvcore
+                        # from fvcore.nn import FlopCountAnalysis, flop_count_table
+                        # # 实例化包装模块
+                        # transformer_wrapper = TransformerWrapper(self.transformer)
+                        # inputs = (
+                        #     latent_model_input,
+                        #     timestep,
+                        #     prompt_embeds,
+                        #     pooled_prompt_embeds,
+                        #     self.joint_attention_kwargs,
+                        #     return_dict,
+                        # )
+                        # flops = FlopCountAnalysis(transformer_wrapper, inputs)
+                        # # flops = register_custom_flop_counters(flops)
+                        # # 打印总的 GFLOPs
+                        # print(f"Total FLOPs: {flops.total() / 1e9:.2f} GFLOPs")
+                        # # 打印每个模块的 FLOPs 细节
+                        # print(flop_count_table(flops))
+
+                        #NOTE: ptflops
+                        # from ptflops import get_model_complexity_info
+                        # model_wrapper = TransformerDynamicWrapper(self.transformer, timestep, prompt_embeds, pooled_prompt_embeds, self.joint_attention_kwargs)
+                        
+                        # # Calculate FLOPs using ptflops
+                        # macs, params = get_model_complexity_info(model_wrapper, (latent_model_input.size(),), as_strings=False,
+                        #                                         print_per_layer_stat=True, verbose=True)
+
+                        # print(f"Model MACs (Multiply-Accumulate Operations): {macs}")
+                        # print(f"Model Parameters: {params}")
+
+                    # NOTE: deepcache
+                    # torch.cuda.empty_cache()  # 如果使用 GPU
+                    # from flops import count_ops_and_params
+                    # example_inputs = {
+                    #     'hidden_states': latent_model_input, 
+                    #     'timestep': timestep,
+                    #     'encoder_hidden_states': prompt_embeds,
+                    #     'pooled_projections': pooled_prompt_embeds,
+                    #     'joint_attention_kwargs': self.joint_attention_kwargs,
+                    #     'return_dict': False,
+                    # }
+                    # macs, nparams = count_ops_and_params(self.transformer, example_inputs=example_inputs, layer_wise=False)
+                    # print("#Params: {:.4f} M".format(nparams/1e6))
+                    # print("#MACs: {:.4f} G".format(macs/1e9))
+                    # del example_inputs, macs, nparams, count_ops_and_params
+                    # torch.cuda.empty_cache()  # 如果使用 GPU
+                    # noise_pred = latent_model_input
+                        #NOTE: thop
+
+                    inputs = (
+                        latent_model_input,
+                        prompt_embeds,
+                        pooled_prompt_embeds,
+                        timestep,
+                        None,
+                        self.joint_attention_kwargs,
+                        False,
+                    )
+                    model_copy = copy.deepcopy(self.transformer)
+                    model_copy._tome_info["step_tmp_force"] = i
+                    macs, params = profile(model_copy, inputs=inputs, verbose=False)
+                    mactracker = MacTracker.get_instance()
+                    mactracker.log(macs, model_copy._tome_info["step_tmp"])
+                    del inputs, macs, params
+                    torch.cuda.empty_cache()  # 如果使用 GPU
+                    noise_pred = latent_model_input
+                else:
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_prompt_embeds,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 each_time.append(time.time() - start_time)
 

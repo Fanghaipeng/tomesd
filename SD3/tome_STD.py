@@ -7,67 +7,21 @@ from diffusers.models.attention import _chunked_feed_forward
 import random
 import time
 from tabulate import tabulate
-from merge import do_nothing, merge_wavg, merge_source, global_merge_2d
-
-TIME_OTHERS = 0
-TIME_COMPUTE_MERGE = 0
-TIME_MERGE_ATTN = 0
-TIME_ATTN = 0
-TIME_UNMERGE_ATTN = 0
-TIME_MERGE_MLP = 0
-TIME_MLP = 0
-TIME_UNMERGE_MLP = 0
-
-def isinstance_str(x: object, cls_name: str):
-    """
-    Checks whether x has any class *named* cls_name in its ancestry.
-    Doesn't require access to the class's implementation.
-    
-    Useful for patching!
-    """
-
-    for _cls in x.__class__.__mro__:
-        if _cls.__name__ == cls_name:
-            return True
-    
-    return False
-
-def init_generator(device: torch.device, fallback: torch.Generator=None):
-    """
-    Forks the current default random generator given device.
-    """
-    if device.type == "cpu":
-        return torch.Generator(device="cpu").set_state(torch.get_rng_state())
-    elif device.type == "cuda":
-        return torch.Generator(device=device).set_state(torch.cuda.get_rng_state())
-    else:
-        if fallback is None:
-            return init_generator(torch.device("cpu"))
-        else:
-            return fallback
-
-def remove_patch(model: torch.nn.Module):
-    """ Removes a patch from a ToMe Diffusion module if it was already patched. """
-    # For diffusers
-    model = model.unet if hasattr(model, "unet") else model.transformer if hasattr(model, "transformer") else model
-
-    for _, module in model.named_modules():
-        if hasattr(module, "_tome_info"):
-            for hook in module._tome_info["hooks"]:
-                hook.remove()
-            module._tome_info["hooks"].clear()
-
-        if module.__class__.__name__ == "ToMeBlock":
-            module.__class__ = module._parent
-    
-    return model
+from merge import do_nothing, merge_wavg, merge_source, global_merge_1d, global_merge_2d, local_merge_2d, local_merge_2d_random
+from counter import TIME_OTHERS, TIME_COMPUTE_MERGE, TIME_MERGE_ATTN, TIME_ATTN, TIME_UNMERGE_ATTN, TIME_MERGE_MLP, TIME_MLP, TIME_UNMERGE_MLP, show_timing_info
+from tome import isinstance_str, init_generator, remove_patch, make_tome_pipe, make_tome_mmdit
 
 def compute_ratio(tome_info):
     ratio_start = tome_info["args"]["ratio_start"]
     ratio_end = tome_info["args"]["ratio_end"]
     step_count = tome_info["step_count"]
-    step_tmp = tome_info["step_tmp"]
+    if tome_info["step_tmp_force"] is not None:
+        step_tmp = tome_info["step_tmp_force"]
+    else:
+        step_tmp = tome_info["step_tmp"]
     ratio_tmp = 1 - (ratio_start + (ratio_end - ratio_start) / (step_count - 1) * step_tmp) # ratio 是裁剪ratio，1 - 好理解
+    # print(step_tmp)
+    # print(ratio_tmp)
     return ratio_tmp
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
@@ -79,7 +33,7 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
     tmp_ratio = compute_ratio(tome_info)
     # print(tmp_ratio)
     # print(x.shape)
-    r = int(x.shape[1] * tmp_ratio)
+    reduce_num = int(x.shape[1] * tmp_ratio)
 
     # Re-init the generator if it hasn't already been initialized or device has changed.
     if args["generator"] is None:
@@ -90,8 +44,18 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
     # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
     # batch, which causes artifacts with use_rand, so force it to be off.
     use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-    m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], r, 
-                                                    no_rand=not use_rand, generator=args["generator"])
+    # m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+    #                                                 no_rand=not use_rand, generator=args["generator"])
+    # m, mp, u  = global_merge_1d(metric=x, layer_idx=tome_info["layer_tmp"], reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"])
+    # m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], window_size=(args["sx"], args["sy"]))
+    # m, mp, u  = local_merge_2d_random(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], window_size=(args["sx"], args["sy"]))
+
+    if tome_info["step_tmp"] < args["replace_step"]:
+        m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num,window_size=(args["sx"], args["sy"]),  
+                                   no_rand=not use_rand, generator=args["generator"])
+    else:
+        m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+                                    no_rand=not use_rand, generator=args["generator"])
 
     if args["prune_replace"] and args["step"] >= args["replace_step"]:
         m_a, u_a = (mp, u) if args["merge_attn"]      else (do_nothing, do_nothing)
@@ -103,52 +67,6 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
         m_m, u_m = (m, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
 
     return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
-
-def show_timing_info_STD():
-    # 创建一个列表，包含所有时间数据和相应的标签
-    data = [
-        ["Norm and Res", TIME_OTHERS],
-        ["Compute Merge", TIME_COMPUTE_MERGE],
-        ["Merge Attention", TIME_MERGE_ATTN],
-        ["Attention", TIME_ATTN],
-        ["Unmerge Attention", TIME_UNMERGE_ATTN],
-        ["Merge MLP", TIME_MERGE_MLP],
-        ["MLP", TIME_MLP],
-        ["Unmerge MLP", TIME_UNMERGE_MLP]
-    ]
-
-    # 使用 tabulate 打印表格，选择 "grid" 格式使表格更易读
-    print(tabulate(data, headers=['Operation', 'Time (seconds)'], tablefmt='grid'))
-
-def make_tome_pipe(pipe_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-
-    class StableDiffusion3Pipeline_ToMe(pipe_class):
-        # Save for unpatching later
-        _parent = pipe_class
-        # Global variables for timing
-        def __call__(self, *args, **kwargs):
-            # 更新自己及孩子的tome_info
-            self._tome_info["step_count"] = kwargs['num_inference_steps']
-            self._tome_info["step_iter"] = list(range(kwargs['num_inference_steps']))
-            self.transformer._tome_info = self._tome_info
-            return super().__call__(*args, **kwargs)
-
-    return StableDiffusion3Pipeline_ToMe
-
-def make_tome_mmdit(model_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    
-    class SD3Transformer2DModel_ToMe(model_class):
-        # Save for unpatching later
-        _parent = model_class
-        # Global variables for timing
-        def forward(self, *args, **kwargs):
-            self._tome_info["layer_count"] = self.config.num_layers
-            self._tome_info["step_tmp"] = self._tome_info["step_iter"].pop(0)
-            self._tome_info["layer_iter"] = list(range(self.config.num_layers))
-
-            return super().forward(*args, **kwargs)
-
-    return SD3Transformer2DModel_ToMe
 
 def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     """
@@ -189,9 +107,11 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
             start_time = time.time()
             if self._tome_info['args']['trace_source']:
                 tmp_dict = {f"{self._tome_info['step_tmp']:02}" + '_' + f"{self._tome_info['layer_tmp']:02}" : merge_source(m_a, norm_hidden_states, None)}
-                print(tmp_dict)
-                self._tome_info['source'].append(tmp_dict)
-            norm_hidden_states = m_a(norm_hidden_states)
+                # print(tmp_dict)
+                # self._tome_info['source'].append(tmp_dict)
+                
+            norm_hidden_states, _ = merge_wavg(m_a, norm_hidden_states)
+            # norm_hidden_states = m_a(norm_hidden_states)
 
             TIME_MERGE_ATTN += time.time() - start_time
             
@@ -216,7 +136,8 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
 
             # (4) ToMe m_m
             start_time = time.time()
-            norm_hidden_states = m_m(norm_hidden_states)
+            norm_hidden_states, _ = merge_wavg(m_m, norm_hidden_states)
+            # norm_hidden_states = m_m(norm_hidden_states)
             TIME_MERGE_MLP += time.time() - start_time
 
             start_time = time.time()
