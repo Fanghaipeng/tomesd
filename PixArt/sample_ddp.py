@@ -11,18 +11,19 @@ from tome import apply_patch_ToMe
 # from counter import show_timing_info
 # from tome_STD import apply_patch_ToMe_STD
 # from diffusers import StableDiffusion3Pipeline
-from pipeline_stable_diffusion_3_SaveStepOutput_TimeCount import StableDiffusion3Pipeline
+from pipeline_pixart_alpha import PixArtAlphaPipeline
 from counter import MacTracker, TimeTracker
 # from deepspeed.profiling.flops_profiler import FlopsProfiler
 import time
+from transformers import T5EncoderModel
 
 import debugpy
 
 # 启动debugpy，监听指定端口
-# debugpy.listen(('0.0.0.0', 15678))
-# print("Waiting for debugger to attach...")
-# debugpy.wait_for_client()
-# print("Debugger attached!")
+debugpy.listen(('0.0.0.0', 15678))
+print("Waiting for debugger to attach...")
+debugpy.wait_for_client()
+print("Debugger attached!")
 
 def load_captions(file_path):
     """
@@ -77,10 +78,19 @@ def main(args):
         print(f"Loaded unduplicated {len(captions_list)} captions.")
 
     # Load the pipeline
+    if args.height == 1024:
+        args.model_path = "/data1/fanghaipeng/checkpoints/PixArt-alpha/PixArt-XL-2-1024-MS"
+    elif args.height == 512:
+        args.model_path = "/data1/fanghaipeng/checkpoints/PixArt-alpha/PixArt-XL-2-512x512"
+    elif args.height == 256:
+        args.model_path = "/data1/fanghaipeng/checkpoints/PixArt-alpha/PixArt-XL-2-256x256"
+
     if args.torch_dtype == "float32":
-        pipe = StableDiffusion3Pipeline.from_pretrained(args.model_path, torch_dtype=torch.float32)
+        pipe = PixArtAlphaPipeline.from_pretrained(args.model_path,torch_dtype=torch.float32, use_safetensors=True)
     elif args.torch_dtype == "float16":
-        pipe = StableDiffusion3Pipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
+        pipe = PixArtAlphaPipeline.from_pretrained(args.model_path,torch_dtype=torch.float16, use_safetensors=True)
+        # pipe = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-256x256",torch_dtype=torch.float16, use_safetensors=True)
+
     pipe = pipe.to(device)
 
     # Ensure all processes have loaded the model before proceeding
@@ -89,9 +99,9 @@ def main(args):
     # Construct output path
     output_path = os.path.join(
         args.output_path, # {pipe.__class__.__name__}-
-        f"{args.height}-{args.width}-{args.num_inference_steps}-{args.guidance_scale}-{args.torch_dtype}-" \
+        f"{args.height}-{args.num_inference_steps}-{args.guidance_scale}-{args.torch_dtype}-" \
         f"{args.tome_type}-prune{args.prune_replace}-x:{args.merge_x}-sa:{args.merge_attn}-ca:{args.merge_crossattn}-mlp:{args.merge_mlp}-"
-        f"step{args.STD_step}-s{args.ratio_start}-e{args.ratio_end}-metric{args.metric_times}-unstep{args.unmerge_steps}-unlayer{args.unmerge_layers}"  
+        f"STD{args.STD_step}-s{args.ratio_start}-e{args.ratio_end}-metric{args.metric_times}-unstep{args.unmerge_steps}-unlayer{args.unmerge_layers}"  
     )
 
     # Create the output directory if it doesn't exist
@@ -137,9 +147,9 @@ def main(args):
                 generator=generator,
                 height=args.height,
                 width=args.width,
+                speed_test=True,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
-                speed_test=True,
             ).images
         image_time = time.time() - start_time
         print(f"Total image for {test_time} batch time spent: {image_time} seconds")
@@ -174,7 +184,7 @@ def main(args):
         batch_captions = local_captions_list[i: i + batch_size]
         prompt_list = [item['caption'] for item in batch_captions]
         id_list = [item['image_id'] for item in batch_captions]
-        
+       
         images = pipe(
             prompt=prompt_list,
             generator=generator,
@@ -183,6 +193,7 @@ def main(args):
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
         ).images
+
         for j, image in enumerate(images):
             image_id = id_list[j]
             image_id = str(image_id).zfill(12)
@@ -197,8 +208,8 @@ if __name__ == "__main__":
     parser.add_argument("--torch-dtype", type=str, default="float32")
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--guidance-scale", type=float, default=7.0)
+    parser.add_argument("--num_inference_steps", type=int, default=20)
+    parser.add_argument("--guidance-scale", type=float, default=4.5)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--test-time", type=int, default=4)

@@ -62,6 +62,23 @@ ref_folder = "/data/fanghaipeng/datasets/COCO2017/val2017_centercrop_1024"
 # print(f"The clean FID of ToMe 0.5-1 prune step 0 is: {score}")
 
 
-image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/StableDiffusion3Pipeline-1024-1024-50-7.0-float16-ToMe-pruneFalse-mergexFalse-step20-0.5-0.4-0.75"
+# image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/1024-1024-50-7.0-float16-ToMe_STD-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e0.5-metric1-unstep0,49-unlayer0,4,8,12,16,20,23"
+# score = fid.compute_fid(ref_folder, image_folder, mode="clean")
+# print(f"The clean FID of 1024-1024-50-7.0-float16-ToMe_STD-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e0.5-metric1-unstep0,49-unlayer0,4,8,12,16,20,23 is: {score}")
+
+
+# image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/1024-1024-50-7.0-float16-ToMe-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e0.5-metric1-unstepNone-unlayerNone"
+# score = fid.compute_fid(ref_folder, image_folder, mode="clean")
+# print(f"The clean FID of /data1/fanghaipeng/project/sora/tomesd/SD3/samples/1024-1024-50-7.0-float16-ToMe-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e0.5-metric1-unstepNone-unlayerNone is: {score}")
+
+
+
+
+image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/1024-1024-50-7.0-float16-ToMe_STD-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e1.0-metric4-unstepNone-unlayerNone"
 score = fid.compute_fid(ref_folder, image_folder, mode="clean")
-print(f"The clean FID of ToMe 0.5-1 prune step 0 is: {score}")
+print(f"The clean FID of 1024-1024-50-7.0-float16-ToMe_STD-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e1.0-metric4-unstepNone-unlayerNone is: {score}")
+
+
+image_folder = "/data1/fanghaipeng/project/sora/tomesd/SD3/samples/1024-1024-50-7.0-float16-ToMe-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e1.0-metric1-unstepNone-unlayerNone"
+score = fid.compute_fid(ref_folder, image_folder, mode="clean")
+print(f"The clean FID of 1024-1024-50-7.0-float16-ToMe-pruneFalse-x:False-sa:True-ca:False-mlp:True-step0-s0.5-e1.0-metric1-unstepNone-unlayerNone is: {score}")

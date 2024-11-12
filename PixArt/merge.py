@@ -10,7 +10,6 @@ from tabulate import tabulate
 from einops import rearrange
 from counter import MacTracker
 
-
 def average_cosine_similarity(hidden_states):
     # 归一化hidden_states，以便于计算余弦相似度
     normed_vectors = F.normalize(hidden_states, p=2, dim=2)

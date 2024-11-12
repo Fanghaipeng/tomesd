@@ -95,9 +95,8 @@ def global_merge_1d(
             b_idx = all_indices[:,:num_dst,:]
 
         def split(x):
-            c = x.shape[-1]
-            src = gather(x, dim=1, index=a_idx.expand(B, N - num_dst, c))
-            dst = gather(x, dim=1, index=b_idx.expand(B, num_dst, c))
+            src = gather(x, dim=1, index=a_idx.expand(x.shape[0], N - num_dst, x.shape[-1]))
+            dst = gather(x, dim=1, index=b_idx.expand(x.shape[0], num_dst, x.shape[-1]))
             return src, dst
         
         a, b = split(metric)
@@ -230,9 +229,8 @@ def global_merge_2d(
         b_idx = rand_idx[:, :num_dst, :] # dst
 
         def split(x):
-            C = x.shape[-1]
-            src = gather(x, dim=1, index=a_idx.expand(B, N - num_dst, C))
-            dst = gather(x, dim=1, index=b_idx.expand(B, num_dst, C))
+            src = gather(x, dim=1, index=a_idx.expand(x.shape[0], N - num_dst, x.shape[-1]))
+            dst = gather(x, dim=1, index=b_idx.expand(x.shape[0], num_dst, x.shape[-1]))
             return src, dst
 
         # Cosine similarity between A and B

@@ -28,8 +28,12 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
 
-from counter import TIME_OTHERS, TIME_COMPUTE_MERGE, TIME_MERGE_ATTN, TIME_ATTN, TIME_UNMERGE_ATTN, TIME_MERGE_MLP, TIME_MLP, TIME_UNMERGE_MLP
-    
+global METRIC_SAVE
+METRIC_SAVE = {}
+
+# from counter import TIME_OTHERS, TIME_COMPUTE_MERGE, TIME_MERGE_ATTN, TIME_ATTN, TIME_UNMERGE_ATTN, TIME_MERGE_MLP, TIME_MLP, TIME_UNMERGE_MLP
+from counter import TimeTracker
+timetracker = TimeTracker.get_instance()
 def isinstance_str(x: object, cls_name: str):
     """
     Checks whether x has any class *named* cls_name in its ancestry.
@@ -75,15 +79,23 @@ def remove_patch(model: torch.nn.Module):
     return model
 
 def compute_ratio(tome_info):
-    ratio_start = tome_info["args"]["ratio_start"]
-    ratio_end = tome_info["args"]["ratio_end"]
-    step_count = tome_info["step_count"]
     if "step_tmp_force" in tome_info:
         tome_info["step_tmp"] = tome_info["step_tmp_force"]
     step_tmp = tome_info["step_tmp"]
-    ratio_tmp = 1 - (ratio_start + (ratio_end - ratio_start) / (step_count - 1) * step_tmp) # ratio 是裁剪ratio，1 - 好理解
-    # print(step_tmp)
-    # print(ratio_tmp)
+    layer_tmp = tome_info["layer_tmp"]
+    if "unmerge_steps" in tome_info["args"] and step_tmp in tome_info["args"]["unmerge_steps"]:
+        # print(step_tmp, layer_tmp)
+        ratio_tmp = 0
+    elif "unmerge_layers" in tome_info["args"] and layer_tmp in tome_info["args"]["unmerge_layers"]:
+        # print(step_tmp, layer_tmp)
+        ratio_tmp = 0
+    else:
+        ratio_start = tome_info["args"]["ratio_start"]
+        ratio_end = tome_info["args"]["ratio_end"]
+        step_count = tome_info["step_count"]
+
+        ratio_tmp = 1 - (ratio_start + (ratio_end - ratio_start) / (step_count - 1) * step_tmp)
+
     return ratio_tmp
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
@@ -106,16 +118,44 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
     # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
     # batch, which causes artifacts with use_rand, so force it to be off.
     use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
+
     # m, mp, u  = global_merge_1d(metric=x, layer_idx=tome_info["layer_tmp"], reduce_num=reduce_num, 
     #                             no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
     # m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], 
     #                            window_size=(args["sx"], args["sy"]), tome_info=tome_info)
     # m, mp, u  = local_merge_2d_random(metric=x, reduce_num=reduce_num, no_rand=not use_rand, generator=args["generator"], 
     #                                   window_size=(args["sx"], args["sy"]), tome_info=tome_info)
-    m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
-                                    no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+    # m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+    #                                 no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+    if args["tome_type"] == "ToMe":
+        m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+                                no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+    elif args["tome_type"] == "ToMe_STD":
+        if tome_info["step_tmp"] in tome_info["args"]["unmerge_steps"] or tome_info["args"]["metric_times"] == 1:
+            if tome_info["step_tmp"] < args["STD_step"]:
+                m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num,window_size=(args["sx"], args["sy"]),  
+                                        no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+            else:
+                m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+                                            no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+        elif tome_info["step_tmp"] % tome_info["args"]["metric_times"] == 0 or tome_info["layer_tmp"] not in tome_info["metric_save"]:
+            if tome_info["step_tmp"] < args["STD_step"]:
+                m, mp, u  = local_merge_2d(metric=x, reduce_num=reduce_num,window_size=(args["sx"], args["sy"]),  
+                                        no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+            else:
+                m, mp, u  = global_merge_2d(x, w, h, args["sx"], args["sy"], reduce_num=reduce_num, 
+                                            no_rand=not use_rand, generator=args["generator"], tome_info=tome_info)
+            if tome_info["args"]["mac_test"]:
+                METRIC_SAVE[tome_info["layer_tmp"]] = (m, mp, u) 
+            else:
+                tome_info["metric_save"][tome_info["layer_tmp"]] = (m, mp, u)
+        else:
+            if tome_info["args"]["mac_test"]:
+                (m, mp, u) = METRIC_SAVE[tome_info["layer_tmp"]]
+            else:
+                (m, mp, u) = tome_info["metric_save"][tome_info["layer_tmp"]]
 
-    if args["prune_replace"] and args["step"] >= args["STD_step"]:
+    if args["prune_replace"] and args["step_tmp"] >= args["STD_step"]:
         m_a, u_a = (mp, u) if args["merge_attn"]      else (do_nothing, do_nothing)
         m_c, u_c = (mp, u) if args["merge_crossattn"] else (do_nothing, do_nothing)
         m_m, u_m = (mp, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
@@ -125,9 +165,6 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
         m_m, u_m = (m, u) if args["merge_mlp"]       else (do_nothing, do_nothing)
 
     return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
-
-
-
 
 def make_tome_pipe(pipe_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
 
@@ -173,18 +210,17 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
             self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor
         ):  
             self._tome_info["layer_tmp"] = self._tome_info["layer_iter"].pop(0)
-            # print(self._tome_info["step_tmp"], self._tome_info["layer_tmp"])
-            global TIME_OTHERS, TIME_COMPUTE_MERGE, TIME_MERGE_ATTN, TIME_ATTN, TIME_UNMERGE_ATTN, \
-                    TIME_MERGE_MLP, TIME_MLP, TIME_UNMERGE_MLP
+            step_tmp = self._tome_info["step_tmp"]
+            layer_tmp = self._tome_info["layer_tmp"]
             
             start_time = time.time()
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-            TIME_OTHERS += time.time() - start_time
+            timetracker.log_time(start_time, "norm1", step_tmp, layer_tmp)
             
             # (1) ToMe
             start_time = time.time()
             m_a, _, m_m, u_a, _, u_m = compute_merge(norm_hidden_states, self._tome_info)
-            TIME_COMPUTE_MERGE += time.time() - start_time
+            timetracker.log_time(start_time, "compute_merge", step_tmp, layer_tmp)
 
             start_time = time.time()
             if self.context_pre_only:
@@ -193,7 +229,7 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
                 norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
                     encoder_hidden_states, emb=temb
                 )
-            TIME_OTHERS += time.time() - start_time
+            timetracker.log_time(start_time, "norm1_context", step_tmp, layer_tmp)
 
             # (2) ToMe m_a
             start_time = time.time()
@@ -204,8 +240,7 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
                 
             norm_hidden_states, _ = merge_wavg(m_a, norm_hidden_states)
             # norm_hidden_states = m_a(norm_hidden_states)
-
-            TIME_MERGE_ATTN += time.time() - start_time
+            timetracker.log_time(start_time, "merge_attn", step_tmp, layer_tmp)
             
             # Attention.
             start_time = time.time()
@@ -214,27 +249,26 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
             )
             # Process attention outputs for the `hidden_states`.
             attn_output = gate_msa.unsqueeze(1) * attn_output
-            TIME_ATTN += time.time() - start_time
+            timetracker.log_time(start_time, "attn", step_tmp, layer_tmp)
 
             # (3) ToMe u_a
             start_time = time.time()
             attn_output = u_a(attn_output)
-            TIME_UNMERGE_ATTN += time.time() - start_time
+            timetracker.log_time(start_time, "unmerge_attn", step_tmp, layer_tmp)
+
             hidden_states = hidden_states + attn_output
 
             start_time = time.time()
             norm_hidden_states = self.norm2(hidden_states)
-            TIME_OTHERS += time.time() - start_time
-
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            timetracker.log_time(start_time, "norm2", step_tmp, layer_tmp)
+            
+            
             # (4) ToMe m_m
             start_time = time.time()
             norm_hidden_states, _ = merge_wavg(m_m, norm_hidden_states)
             # norm_hidden_states = m_m(norm_hidden_states)
-            TIME_MERGE_MLP += time.time() - start_time
-
-            start_time = time.time()
-            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-            TIME_OTHERS += time.time() - start_time
+            timetracker.log_time(start_time, "merge_mlp", step_tmp, layer_tmp)
 
             start_time = time.time()
             if self._chunk_size is not None:
@@ -243,12 +277,12 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
             else:
                 ff_output = self.ff(norm_hidden_states)
             ff_output = gate_mlp.unsqueeze(1) * ff_output
-            TIME_MLP += time.time() - start_time
+            timetracker.log_time(start_time, "mlp", step_tmp, layer_tmp)
 
             # (5) ToMe u_m
             start_time = time.time()
             ff_output = u_m(ff_output)
-            TIME_UNMERGE_MLP += time.time() - start_time
+            timetracker.log_time(start_time, "unmerge_mlp", step_tmp, layer_tmp)
 
             hidden_states = hidden_states + ff_output
 
@@ -270,7 +304,7 @@ def make_tome_block_mmdit(block_class: Type[torch.nn.Module]) -> Type[torch.nn.M
                 else:
                     context_ff_output = self.ff_context(norm_encoder_hidden_states)
                 encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
-            TIME_OTHERS += time.time() - start_time
+            timetracker.log_time(start_time, "norm2_context", step_tmp, layer_tmp)
             
             return encoder_hidden_states, hidden_states
 
@@ -291,7 +325,12 @@ def apply_patch_ToMe(
         prune_replace: bool = False,
         trace_source: bool = False,
         STD_step: int = 0,
-        speed_test: bool = False,):
+        speed_test: bool = False,
+        mac_test: bool = False,
+        unmerge_steps: list = [],
+        unmerge_layers: list = [],
+        tome_type: str = "ToMe",
+        metric_times: int = 1,):
     """
     Patches a stable diffusion model with ToMe.
     Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
@@ -327,7 +366,7 @@ def apply_patch_ToMe(
         "layer_iter": None,
         "layer_tmp": None,
         "source": [],
-        "profiler": None,
+        "metric_save": {},
         "args": {
             "save_dir" : save_dir,
             "ratio_start": ratio_start,
@@ -336,6 +375,7 @@ def apply_patch_ToMe(
             "sx": sx, "sy": sy,
             "use_rand": use_rand,
             "generator": None,
+            "tome_type": tome_type,
             "merge_attn": merge_attn,
             "merge_crossattn": merge_crossattn,
             "merge_mlp": merge_mlp,
@@ -344,6 +384,10 @@ def apply_patch_ToMe(
             "STD_step": STD_step,
             "trace_source": trace_source,
             "speed_test": speed_test,
+            "mac_test": mac_test,
+            "unmerge_steps": unmerge_steps,
+            "unmerge_layers": unmerge_layers,
+            "metric_times": metric_times,
         }
     }
     mmdit = pipe.transformer

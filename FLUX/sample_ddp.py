@@ -11,14 +11,14 @@ from tome import apply_patch_ToMe
 # from counter import show_timing_info
 # from tome_STD import apply_patch_ToMe_STD
 # from diffusers import StableDiffusion3Pipeline
-from pipeline_stable_diffusion_3_SaveStepOutput_TimeCount import StableDiffusion3Pipeline
+from pipeline_flux import FluxPipeline
 from counter import MacTracker, TimeTracker
 # from deepspeed.profiling.flops_profiler import FlopsProfiler
 import time
 
 import debugpy
 
-# 启动debugpy，监听指定端口
+## 启动debugpy，监听指定端口
 # debugpy.listen(('0.0.0.0', 15678))
 # print("Waiting for debugger to attach...")
 # debugpy.wait_for_client()
@@ -78,9 +78,9 @@ def main(args):
 
     # Load the pipeline
     if args.torch_dtype == "float32":
-        pipe = StableDiffusion3Pipeline.from_pretrained(args.model_path, torch_dtype=torch.float32)
+        pipe = FluxPipeline.from_pretrained(args.model_path, torch_dtype=torch.float32)
     elif args.torch_dtype == "float16":
-        pipe = StableDiffusion3Pipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
+        pipe = FluxPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
     pipe = pipe.to(device)
 
     # Ensure all processes have loaded the model before proceeding
@@ -203,9 +203,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--test-time", type=int, default=4)
     parser.add_argument("--tome-type", type=str, choices=["default", "ToMe", "ToMe_STD"], default="default")
-    parser.add_argument("--ratio", type=float, default=0.5)
-    parser.add_argument("--ratio-start", type=float, default=0.5)
-    parser.add_argument("--ratio-end", type=float, default=0.5)
+    parser.add_argument("--ratio", type=float, default=1.0)
+    parser.add_argument("--ratio-start", type=float, default=1.0)
+    parser.add_argument("--ratio-end", type=float, default=1.0)
     parser.add_argument("--save-step", type=bool, default=False)
     parser.add_argument("--speed-test", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mac-test", action=argparse.BooleanOptionalAction, default=False)
